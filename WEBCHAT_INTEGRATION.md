@@ -3,7 +3,8 @@
 This branch combines upstream main `1131a0222a27f391bf8f27cca6f278ddf7ace8dd`,
 the session ownership and bounded-launch repairs proposed in upstream PR #375,
 and the Webchat casting adapter and Chromium extension launch configuration.
-The casting files preserve the installed Webchat viewer behavior at integration.
+The casting files preserve the maintained Webchat adapter, including audio playout
+capability and buffered frame presentation on live and resized frames.
 
 Webchat pins the full fork commit in its shared-browser setup script.
 Build that recorded commit, never a moving branch tip. A submodule is deferred.

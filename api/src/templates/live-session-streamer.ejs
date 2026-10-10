@@ -799,7 +799,7 @@
                       tabs[pageId].lastImageData = imageData;
                       tabs[pageId].lastFramePayload = payload;
 
-                img.onload = () => {
+                const presentImage = () => {
                           if (!isCurrentSocket()) return;
                           if (webchatAdapter && !webchatAdapter.frame(pageId, payload)) return;
                           tabs[pageId].currentImageWidth = img.naturalWidth;
@@ -819,6 +819,10 @@
                           webchatAdapter?.frame(pageId, payload, true);
                           webchatAdapter?.stateChanged();
                       };
+                img.onload = () => {
+                    if (webchatAdapter?.scheduleFrame) webchatAdapter.scheduleFrame(pageId, payload, presentImage);
+                    else presentImage();
+                };
 
                       img.src = imageData;
                   }
@@ -1474,7 +1478,7 @@
           if (typeof window.webchatSteelAdapterFactory === 'function') {
               webchatAdapter = window.webchatSteelAdapterFactory({
                   version: 3,
-                  capabilities: ['owned-tabs', 'target-activation', 'viewport-ack', 'control-ownership', 'picker-coordination'],
+                  capabilities: ['owned-tabs', 'target-activation', 'viewport-ack', 'control-ownership', 'picker-coordination', 'audio-playout'],
                   snapshot: () => ({
                       tabs: Object.entries(tabs).filter(([id]) => id !== 'tab-discovery')
                           .map(([id, tab]) => ({ id, title: tab.title || 'New Tab', url: tab.url || '' })),
@@ -1584,9 +1588,10 @@
 
               // Redraw the last image if available
               if (tabData.lastImageData) {
+                  const resizedFrame = tabData.lastFramePayload;
                   const img = new Image();
-                  img.onload = () => {
-                      if (webchatAdapter && !webchatAdapter.frame(pageId, tabData.lastFramePayload)) return;
+                  const presentResize = () => {
+                      if (webchatAdapter && !webchatAdapter.frame(pageId, resizedFrame)) return;
                       ctx.drawImage(
                           img,
                           0,
@@ -1594,6 +1599,10 @@
                           Math.floor(canvas.width / window.devicePixelRatio),
                           Math.floor(canvas.height / window.devicePixelRatio)
                       );
+                  };
+                  img.onload = () => {
+                      if (webchatAdapter?.scheduleFrame) webchatAdapter.scheduleFrame(pageId, resizedFrame, presentResize);
+                      else presentResize();
                   };
                   img.src = tabData.lastImageData;
               }
