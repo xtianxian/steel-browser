@@ -35,5 +35,11 @@
   },
   "overrides": {
     "tar-fs": ">=3.1.1"
+  },
+  "allowScripts": {
+    "duckdb@1.4.2": true,
+    "classic-level@2.0.0": true,
+    "@swc/core@1.13.3": true,
+    "esbuild@0.25.9": true
   }
 }
