@@ -1047,7 +1047,7 @@ export class CDPService extends EventEmitter {
           defaultViewport: null,
           args: launchArgs,
           executablePath: this.chromeExecPath,
-          ignoreDefaultArgs: ["--enable-automation"],
+          ignoreDefaultArgs: ["--enable-automation", "--disable-extensions"],
           timeout: Math.min(
             options.timeout && options.timeout > 0 ? options.timeout : 30_000,
             scope.remaining(),

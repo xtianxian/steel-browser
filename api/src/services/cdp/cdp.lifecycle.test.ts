@@ -75,6 +75,10 @@ describe("CDP launch deadline and owned cleanup", () => {
     await vi.waitFor(() => expect(puppeteer.launch).toHaveBeenCalledOnce());
     expect(vi.mocked(puppeteer.launch).mock.calls[0][0]?.timeout).toBeGreaterThan(0);
     expect(vi.mocked(puppeteer.launch).mock.calls[0][0]?.timeout).toBeLessThanOrEqual(30_000);
+    expect(vi.mocked(puppeteer.launch).mock.calls[0][0]?.ignoreDefaultArgs).toEqual([
+      "--enable-automation",
+      "--disable-extensions",
+    ]);
     controller.abort();
     await expect(launch).rejects.toMatchObject({ name: "AbortError" });
     launchResult.resolve(browser);

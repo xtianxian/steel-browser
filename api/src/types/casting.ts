@@ -6,6 +6,7 @@ export type MouseEvent = {
     x: number;
     y: number;
     button: "none" | "left" | "middle" | "right";
+    buttons?: number;
     modifiers: number;
     clickCount?: number;
     deltaX?: number;
@@ -56,6 +57,16 @@ export type ClipboardReadEvent = {
 export type GetSelectedTextEvent = {
   type: "getSelectedText";
   pageId: string;
+};
+
+export type ResizeEvent = {
+  type: "resize";
+  pageId: string;
+  revision?: number;
+  width: number;
+  height: number;
+  mobile: boolean;
+  deviceScaleFactor: number;
 };
 
 export type PageInfo = {

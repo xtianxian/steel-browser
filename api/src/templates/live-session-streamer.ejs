@@ -122,11 +122,9 @@
           }
           .canvas {
             position: absolute;
-            height: 100%;
-            width: auto;
             left: 50%;
-            transform: translateX(-50%);
-            object-fit: contain;
+            top: 50%;
+            transform: translate(-50%, -50%);
           }
 
           /* Tab bar styles */
@@ -489,6 +487,7 @@
         </div>
     </div>
 
+    <script>/* WEBCHAT_STEEL_ADAPTER_V3 */</script>
     <script>
     (function() {
           // Global flag for single page mode
@@ -506,6 +505,53 @@
 
           let tabs = {};
           let activeTabId = null;
+          let requestedViewport = null;
+          let webchatAdapter = null;
+
+          function sendRequestedViewport(pageId) {
+              if (webchatAdapter) return;
+              const tab = tabs[pageId];
+              const ws = tab?.websocket;
+              if (!requestedViewport || !ws || ws.readyState !== WebSocket.OPEN) return;
+              const desired = JSON.stringify(requestedViewport);
+              if (tab.webchatDesiredViewport !== desired) {
+                  tab.webchatDesiredViewport = desired;
+                  tab.webchatPendingViewport = null;
+                  tab.webchatViewportAttempts = 0;
+              }
+              if (tab.webchatAppliedViewport === desired || tab.webchatPendingViewport === desired
+                  || tab.webchatViewportAttempts >= 3) return;
+              const revision = (tab.webchatViewportRevision || 0) + 1;
+              tab.webchatViewportRevision = revision;
+              tab.webchatViewportAttempts += 1;
+              tab.webchatPendingViewport = desired;
+              try {
+                  ws.send(JSON.stringify({ type: 'resize', pageId, revision, ...requestedViewport }));
+              } catch {
+                  tab.webchatPendingViewport = null;
+                  setTimeout(() => sendRequestedViewport(pageId), 150);
+                  return;
+              }
+              setTimeout(() => {
+                  if (tabs[pageId] !== tab || tab.websocket !== ws || tab.webchatViewportRevision !== revision
+                      || tab.webchatPendingViewport !== desired) return;
+                  tab.webchatPendingViewport = null;
+                  sendRequestedViewport(pageId);
+              }, 2000);
+          }
+
+          window.addEventListener('message', (event) => {
+              if (webchatAdapter || event.origin !== window.location.origin || event.source !== window.parent || event.data?.type !== 'steelViewport') return;
+              const { width, height, mobile, deviceScaleFactor } = event.data;
+              if (!Number.isInteger(width) || !Number.isInteger(height)
+                  || width < 320 || width > 3840 || height < 240 || height > 2160) return;
+              requestedViewport = { width, height, mobile: Boolean(mobile), deviceScaleFactor };
+              if (activeTabId && tabs[activeTabId]?.receivedFirstFrame) {
+                  const tab = tabs[activeTabId];
+                  if (tab.webchatViewportAttempts >= 3) tab.webchatViewportAttempts = 0;
+                  sendRequestedViewport(activeTabId);
+              }
+          });
 
           // WebSocket connection management
           const baseWsUrl = '<%= wsUrl %>';
@@ -514,7 +560,7 @@
 
           // Default dimensions until we get first image
           const defaultWidth = <%= dimensions?.width || 1920 %>;
-          const defaultHeight = <%= dimensions?.width || 1080 %>;
+          const defaultHeight = <%= dimensions?.height || 1080 %>;
 
           // Function to set connection status
           function setConnectionStatus(online) {
@@ -532,10 +578,12 @@
                       updateUrlBar('Session not connected');
                   }
               }
+              webchatAdapter?.stateChanged();
           }
 
           // Function to create WebSocket URL for a specific page
           function createWebSocketUrl(pageId) {
+              if (webchatAdapter) return webchatAdapter.socketUrl(pageId);
               // For single-page mode, the URL already includes the pageId
               if (singlePageMode) return baseWsUrl;
 
@@ -550,12 +598,6 @@
 
           // Function to establish WebSocket connection for a tab
           function connectTabWebSocket(pageId) {
-              // Prevent reconnection if already in progress
-              if (tabs[pageId] && tabs[pageId].reconnecting) {
-                  console.log(`Reconnection for tab ${pageId} already in progress, ignoring duplicate request`);
-                  return;
-              }
-
               // If tab has an existing connection and it's open or connecting, don't create a new one
               if (tabs[pageId] && tabs[pageId].websocket) {
                   const ws = tabs[pageId].websocket;
@@ -583,14 +625,28 @@
 
               // Create a new WebSocket for this tab
               const ws = new WebSocket(createWebSocketUrl(pageId));
+              if (webchatAdapter) {
+                  const send = ws.send.bind(ws);
+                  ws.send = (value) => {
+                      const outgoing = webchatAdapter.outgoing(pageId, value);
+                      if (outgoing !== null) send(outgoing);
+                  };
+              }
               console.log(`Connecting websocket for tab ${pageId}`);
 
               if (tabs[pageId]) {
                   tabs[pageId].websocket = ws;
+                  tabs[pageId].receivedFirstFrame = false;
+                  tabs[pageId].webchatAppliedViewport = null;
+                  tabs[pageId].webchatPendingViewport = null;
+                  tabs[pageId].webchatViewportAttempts = 0;
               }
+
+              const isCurrentSocket = () => pageId === 'tab-discovery' || tabs[pageId]?.websocket === ws;
 
               // Set up event handlers
               ws.onopen = () => {
+                  if (!isCurrentSocket()) return;
                   console.log(`WebSocket connection opened for tab ${pageId}`);
 
                   // Clear reconnection status
@@ -621,6 +677,7 @@
               };
 
               ws.onclose = () => {
+                  if (!isCurrentSocket()) return;
                   console.log(`WebSocket connection closed for tab ${pageId}`);
 
                   if (tabs[pageId]) {
@@ -640,6 +697,7 @@
 
               // Add error handler to explicitly handle connection failures
               ws.onerror = () => {
+                  if (!isCurrentSocket()) return;
                   console.log(`WebSocket connection error for tab ${pageId}`);
 
                   if(pageId === 'tab-discovery') {
@@ -654,7 +712,11 @@
               };
 
               ws.onmessage = (event) => {
-                  const payload = JSON.parse(event.data);
+                  if (!isCurrentSocket()) return;
+                  let payload;
+                  try { payload = JSON.parse(event.data); } catch { return; }
+                  if (!payload || typeof payload !== 'object') return;
+                  if (webchatAdapter?.message(pageId, payload)) return;
 
                   // Handle tab-discovery messages
                   if (pageId === 'tab-discovery') {
@@ -678,6 +740,18 @@
                   if (payload.type === "tabUpdate") {
                       updateTabInfo(pageId, payload.url, payload.title, payload.favicon);
                       return;
+                  } else if (payload.type === "viewportApplied" || payload.type === "viewportFailed") {
+                      const tab = tabs[pageId];
+                      if (tab && payload.pageId === pageId && payload.revision === tab.webchatViewportRevision) {
+                          if (payload.type === "viewportApplied") {
+                              tab.webchatAppliedViewport = tab.webchatPendingViewport;
+                              tab.webchatPendingViewport = null;
+                          } else {
+                              tab.webchatPendingViewport = null;
+                              setTimeout(() => sendRequestedViewport(pageId), 150);
+                          }
+                      }
+                      return;
                   } else if (payload.type === "targetClosed") {
                       handleTabClosed(pageId);
                       return;
@@ -685,6 +759,7 @@
 
                   // Handle canvas image data
                   if (payload.data) {
+                      if (webchatAdapter && !webchatAdapter.frame(pageId, payload)) return;
                       if (!tabs[pageId]) {
                           // console.error(`Received data for nonexistent tab ${pageId}`);
                           return;
@@ -694,7 +769,8 @@
                       tabs[pageId].canvasContainer.classList.remove('tab-switching');
 
                       // Mark that we've received at least one frame for this tab
-                      tabs[pageId].receivedFirstFrame = true;
+                      const firstFrame = !tabs[pageId].receivedFirstFrame;
+                      if (firstFrame) sendRequestedViewport(pageId);
                       if(urlText) urlText.disabled = false;
 
                       if (urlText && document.activeElement !== urlText){
@@ -721,8 +797,11 @@
                 const img = new Image();
                       const imageData = 'data:image/jpeg;base64,' + payload.data;
                       tabs[pageId].lastImageData = imageData;
+                      tabs[pageId].lastFramePayload = payload;
 
                 img.onload = () => {
+                          if (!isCurrentSocket()) return;
+                          if (webchatAdapter && !webchatAdapter.frame(pageId, payload)) return;
                           tabs[pageId].currentImageWidth = img.naturalWidth;
                           tabs[pageId].currentImageHeight = img.naturalHeight;
                           updateCanvasSize(pageId);
@@ -736,6 +815,9 @@
                           );
 
                           tabs[pageId].canvasContainer.style.backgroundColor = 'var(--bg-secondary)';
+                          tabs[pageId].receivedFirstFrame = true;
+                          webchatAdapter?.frame(pageId, payload, true);
+                          webchatAdapter?.stateChanged();
                       };
 
                       img.src = imageData;
@@ -763,7 +845,7 @@
               const faviconElement = document.createElement('img');
               faviconElement.className = 'tab-favicon';
               if (favicon) {
-                  faviconElement.src = favicon;
+                  if (!webchatAdapter) faviconElement.src = favicon;
               } else {
                   faviconElement.style.display = 'none';
               }
@@ -844,6 +926,7 @@
 
           // Function to activate a tab
           function activateTab(pageId) {
+              if (webchatAdapter && activeTabId === pageId) return;
               if (!tabs[pageId]) {
                   console.error(`Attempted to activate nonexistent tab ${pageId}`);
                   return;
@@ -854,14 +937,12 @@
                   tabs[activeTabId].tab.classList.remove('active');
                   tabs[activeTabId].canvasContainer.classList.remove('active');
 
-                  // Intentionally close the WebSocket for the inactive tab if it exists to save resources
-                  if (tabs[activeTabId].websocket &&
-                      tabs[activeTabId].websocket.readyState === WebSocket.OPEN) {
-                      tabs[activeTabId].intentionalClose = true;
-                      tabs[activeTabId].websocket.close();
-                      tabs[activeTabId].websocket = null;
-                      console.log(`Closed WebSocket for inactive tab ${activeTabId}`);
-                  }
+                  // Release connecting sockets too. Late events belong to the old cast.
+                  const previous = tabs[activeTabId];
+                  const socket = previous.websocket;
+                  previous.websocket = null;
+                  previous.reconnecting = false;
+                  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
               }
 
               // Set the new active tab
@@ -898,6 +979,7 @@
 
               // Update canvas size for the active tab
               updateCanvasSize(pageId);
+              webchatAdapter?.stateChanged();
           }
 
           // Function to attempt reconnection for a tab WebSocket
@@ -964,9 +1046,12 @@
               if (!canvas || !ws || !interactive) return;
 
               // Remove any existing event listeners first to prevent duplicates
-              canvas.removeEventListener('mousedown', canvas._mouseDownHandler);
-              canvas.removeEventListener('mouseup', canvas._mouseUpHandler);
-              canvas.removeEventListener('mousemove', canvas._mouseMoveHandler);
+              canvas.removeEventListener('pointerdown', canvas._pointerDownHandler);
+              canvas.removeEventListener('pointerup', canvas._pointerUpHandler);
+              canvas.removeEventListener('pointermove', canvas._pointerMoveHandler);
+              canvas.removeEventListener('pointercancel', canvas._pointerCancelHandler);
+              canvas.removeEventListener('lostpointercapture', canvas._lostPointerCaptureHandler);
+              canvas.removeEventListener('contextmenu', canvas._contextMenuHandler);
               canvas.removeEventListener('wheel', canvas._wheelHandler);
 
               // Helper function for scaled coordinates
@@ -996,102 +1081,74 @@
                   };
               }
 
-              // MouseDown event
-              canvas._mouseDownHandler = (e) => {
+              // Keep one pointer captured through press, movement, and release. Mouse
+              // listeners bound only to the canvas lose the release outside its edge.
+              let activePointer = null;
+              let lastHoverMoveAt = 0;
+              canvas.style.touchAction = 'none';
+
+              function sendPointerEvent(type, e, button, buttons) {
                   if (ws.readyState !== WebSocket.OPEN) return;
-
                   const coords = getScaledCoordinates(e, canvas, pageId);
-
                   ws.send(JSON.stringify({
                       type: 'mouseEvent',
-                      pageId: pageId,
+                      pageId,
                       event: {
-                          type: 'mousePressed',
+                          type,
                           x: coords.x,
                           y: coords.y,
-                          button: e.button === 0 ? 'left' : e.button === 1 ? 'middle' : 'right',
+                          button,
+                          buttons,
                           modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0),
-                          clickCount: e.detail
+                          clickCount: type === 'mouseMoved' ? undefined : e.detail || 1
                       }
                   }));
-
-                  console.log(`Mouse down at ${coords.x},${coords.y} with button ${e.button}`);
-              };
-              canvas.addEventListener('mousedown', canvas._mouseDownHandler);
-
-              // MouseUp event
-              canvas._mouseUpHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseReleased',
-                          x: coords.x,
-                          y: coords.y,
-                          button: e.button === 0 ? 'left' : e.button === 1 ? 'middle' : 'right',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0),
-                          clickCount: e.detail
-                      }
-                  }));
-
-                  console.log(`Mouse up at ${coords.x},${coords.y} with button ${e.button}`);
-              };
-              canvas.addEventListener('mouseup', canvas._mouseUpHandler);
-
-              // MouseMove event
-              canvas._mouseMoveHandler = (e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
-
-                  const coords = getScaledCoordinates(e, canvas, pageId);
-
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseMoved',
-                          x: coords.x,
-                          y: coords.y,
-                          button: 'none',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
-                      }
-                  }));
-              };
-
-              // Debounce function to limit how often events are sent
-              function debounce(func, wait) {
-                  let timeout;
-                  return function(...args) {
-                      const context = this;
-                      clearTimeout(timeout);
-                      timeout = setTimeout(() => func.apply(context, args), wait);
-                  };
               }
 
-              // Create debounced version of mouseMoveHandler
-              canvas._debouncedMouseMoveHandler = debounce((e) => {
-                  if (ws.readyState !== WebSocket.OPEN) return;
+              function releasePointer(e) {
+                  if (!activePointer || activePointer.id !== e.pointerId) return;
+                  const button = activePointer.button;
+                  activePointer = null;
+                  sendPointerEvent('mouseReleased', e, button, 0);
+                  if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+              }
 
-                  const coords = getScaledCoordinates(e, canvas, pageId);
+              canvas._pointerDownHandler = (e) => {
+                  if (ws.readyState !== WebSocket.OPEN || activePointer || !e.isPrimary) return;
+                  const button = e.button === 0 ? 'left' : e.button === 1 ? 'middle' : e.button === 2 ? 'right' : 'none';
+                  if (button === 'none') return;
+                  const buttons = e.buttons || (button === 'left' ? 1 : button === 'right' ? 2 : 4);
+                  activePointer = { id: e.pointerId, button, buttons };
+                  canvas.setPointerCapture(e.pointerId);
+                  sendPointerEvent('mousePressed', e, button, buttons);
+                  e.preventDefault();
+              };
+              canvas.addEventListener('pointerdown', canvas._pointerDownHandler);
 
-                  ws.send(JSON.stringify({
-                      type: 'mouseEvent',
-                      pageId: pageId,
-                      event: {
-                          type: 'mouseMoved',
-                          x: coords.x,
-                          y: coords.y,
-                          button: 'none',
-                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
+              canvas._pointerMoveHandler = (e) => {
+                  if (activePointer) {
+                      if (activePointer.id !== e.pointerId) return;
+                      if (!e.buttons) {
+                          releasePointer(e);
+                          return;
                       }
-                  }));
-              }, 20); // 20ms debounce time - adjust as needed for performance vs responsiveness
+                      sendPointerEvent('mouseMoved', e, activePointer.button, activePointer.buttons);
+                      return;
+                  }
+                  if (Date.now() - lastHoverMoveAt < 20) return;
+                  lastHoverMoveAt = Date.now();
+                  sendPointerEvent('mouseMoved', e, 'none', 0);
+              };
+              canvas.addEventListener('pointermove', canvas._pointerMoveHandler);
 
-              // Attach the debounced handler to mousemove event
-              canvas.addEventListener('mousemove', canvas._debouncedMouseMoveHandler);
+              canvas._pointerUpHandler = releasePointer;
+              canvas._pointerCancelHandler = releasePointer;
+              canvas._lostPointerCaptureHandler = releasePointer;
+              canvas.addEventListener('pointerup', canvas._pointerUpHandler);
+              canvas.addEventListener('pointercancel', canvas._pointerCancelHandler);
+              canvas.addEventListener('lostpointercapture', canvas._lostPointerCaptureHandler);
+              canvas._contextMenuHandler = (e) => e.preventDefault();
+              canvas.addEventListener('contextmenu', canvas._contextMenuHandler);
 
               // Wheel event
               canvas._wheelHandler = (e) => {
@@ -1135,16 +1192,18 @@
 
                   const ws = tabs[activeTabId].websocket;
                   if (ws.readyState !== WebSocket.OPEN) return;
+                  if (e.ctrlKey || e.metaKey) e.preventDefault();
 
                   ws.send(JSON.stringify({
                       type: 'keyEvent',
                       pageId: activeTabId,
                       event: {
                           type: 'keyDown',
-                          text: e.key.length === 1 ? e.key : undefined,
+                          text: e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey ? e.key : undefined,
                           code: e.code,
                           key: e.key,
-                          keyCode: e.keyCode
+                          keyCode: e.keyCode,
+                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
                       }
                   }));
               });
@@ -1162,10 +1221,11 @@
                       pageId: activeTabId,
                       event: {
                           type: 'keyUp',
-                          text: e.key.length === 1 ? e.key : undefined,
+                          text: e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey ? e.key : undefined,
                           code: e.code,
                           key: e.key,
-                          keyCode: e.keyCode
+                          keyCode: e.keyCode,
+                          modifiers: (e.ctrlKey ? 2 : 0) | (e.shiftKey ? 8 : 0) | (e.altKey ? 1 : 0) | (e.metaKey ? 4 : 0)
                       }
                   }));
               });
@@ -1282,7 +1342,7 @@
                   if (!tabs[tab.id]) {
                       // Make sure we pass parameters in the right order: id, url, title, favicon
                       createTab(tab.id, tab.url || '', tab.title || 'New Tab', tab.favicon || null);
-                      if (index === tabList.length - 1) {
+                      if (!webchatAdapter && index === tabList.length - 1) {
                           activateTab(tab.id);
                       }
                   } else {
@@ -1335,7 +1395,7 @@
               // Update favicon if available
               const faviconElem = tabData.tab.querySelector('.tab-favicon');
               if (faviconElem && tabData.favicon) {
-                  faviconElem.src = tabData.favicon;
+                  if (!webchatAdapter) faviconElem.src = tabData.favicon;
                   faviconElem.style.display = 'block';
               } else if (faviconElem) {
                   faviconElem.style.display = 'none';
@@ -1346,6 +1406,7 @@
                   updateUrlBar(tabData.url || '');
                   updateSecurityIcon(tabData.url || '');
               }
+              webchatAdapter?.stateChanged();
           }
 
           // Function to handle tab closed by server
@@ -1360,7 +1421,7 @@
 
               const tabIndexes = Object.keys(tabs).filter(id => id !== 'tab-discovery');
 
-              if (tabIndexes.length <= 1) {
+              if (tabIndexes.length <= 1 && !webchatAdapter) {
                   return;
               }
 
@@ -1371,7 +1432,7 @@
               // Intentionally close the WebSocket
               if (tabs[pageId].websocket) {
                   tabs[pageId].intentionalClose = true;
-                  tabs[pageId].websocket.send(JSON.stringify({
+                  if (!webchatAdapter) tabs[pageId].websocket.send(JSON.stringify({
                       type: 'closeTab',
                       pageId: pageId
                   }));
@@ -1405,6 +1466,38 @@
 
               // Delete tab from tabs object
               delete tabs[pageId];
+              if (activeTabId === pageId) activeTabId = null;
+              webchatAdapter?.stateChanged();
+          }
+
+          // Versioned embedding boundary. This hook is part of the pinned adapter contract.
+          if (typeof window.webchatSteelAdapterFactory === 'function') {
+              webchatAdapter = window.webchatSteelAdapterFactory({
+                  version: 3,
+                  capabilities: ['owned-tabs', 'target-activation', 'viewport-ack', 'control-ownership', 'picker-coordination'],
+                  snapshot: () => ({
+                      tabs: Object.entries(tabs).filter(([id]) => id !== 'tab-discovery')
+                          .map(([id, tab]) => ({ id, title: tab.title || 'New Tab', url: tab.url || '' })),
+                      activeTabId,
+                      connected: Boolean(activeTabId && tabs[activeTabId]?.receivedFirstFrame
+                          && tabs[activeTabId]?.websocket?.readyState === WebSocket.OPEN),
+                  }),
+                  activate: activateTab,
+                  syncTabs: (owned) => {
+                      const ids = new Set(owned.map((tab) => tab.id));
+                      for (const id of Object.keys(tabs)) if (id !== 'tab-discovery' && !ids.has(id)) closeTab(id);
+                      for (const tab of owned) {
+                          if (!tabs[tab.id]) createTab(tab.id, tab.url, tab.title);
+                          else updateTabInfo(tab.id, tab.url, tab.title);
+                      }
+                      webchatAdapter.stateChanged();
+                  },
+                  send: (pageId, payload) => {
+                      const socket = tabs[pageId]?.websocket;
+                      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
+                  },
+              });
+              webchatAdapter.stateChanged();
           }
 
           // Initialize connection - in single-page mode we have only one connection
@@ -1467,11 +1560,13 @@
                   return;
               }
 
-              const parentHeight = container.clientHeight;
-
-              // Scale to height while maintaining aspect ratio
-              const targetHeight = parentHeight;
-              const targetWidth = targetHeight * (tabData.currentImageWidth / tabData.currentImageHeight);
+              const scale = Math.min(
+                  1,
+                  container.clientWidth / tabData.currentImageWidth,
+                  container.clientHeight / tabData.currentImageHeight
+              );
+              const targetWidth = Math.max(1, Math.floor(tabData.currentImageWidth * scale));
+              const targetHeight = Math.max(1, Math.floor(tabData.currentImageHeight * scale));
 
               // Account for device pixel ratio
               const dpr = window.devicePixelRatio || 1;
@@ -1484,13 +1579,14 @@
               ctx.scale(dpr, dpr);
 
               // Set display size
-              canvas.style.height = '100%';
-              canvas.style.width = 'auto';
+              canvas.style.width = targetWidth + 'px';
+              canvas.style.height = targetHeight + 'px';
 
               // Redraw the last image if available
               if (tabData.lastImageData) {
                   const img = new Image();
                   img.onload = () => {
+                      if (webchatAdapter && !webchatAdapter.frame(pageId, tabData.lastFramePayload)) return;
                       ctx.drawImage(
                           img,
                           0,
@@ -1679,10 +1775,16 @@
           const originalConnectTabWebSocket = connectTabWebSocket;
           connectTabWebSocket = function(pageId) {
               const ws = originalConnectTabWebSocket(pageId);
+              if (ws.webchatClipboardWrapped) return ws;
+              ws.webchatClipboardWrapped = true;
 
               const originalOnMessage = ws.onmessage;
               ws.onmessage = function(event) {
-                  const payload = JSON.parse(event.data);
+                  if (pageId !== 'tab-discovery' && tabs[pageId]?.websocket !== ws) return;
+                  let payload;
+                  try { payload = JSON.parse(event.data); } catch { return; }
+                  if (!payload || typeof payload !== 'object') return;
+                  if (webchatAdapter?.message(pageId, payload)) return;
 
                   if (payload.type === "selectedTextResponse") {
 
@@ -1706,6 +1808,9 @@
 
               return ws;
           };
+          window.addEventListener('resize', () => {
+              if (activeTabId && tabs[activeTabId]) updateCanvasSize(activeTabId);
+          });
     })();
     </script>
 </body>

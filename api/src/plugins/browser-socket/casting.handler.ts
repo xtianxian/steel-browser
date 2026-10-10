@@ -1,5 +1,5 @@
 import { IncomingMessage } from "http";
-import puppeteer, { Browser, CDPSession, Page } from "puppeteer-core";
+import puppeteer, { Browser, CDPSession, Page, Target } from "puppeteer-core";
 import { Duplex } from "stream";
 import WebSocket, { Server } from "ws";
 
@@ -12,8 +12,202 @@ import {
   MouseEvent,
   NavigationEvent,
   PageInfo,
+  ResizeEvent,
 } from "../../types/casting.js";
-import { getPageFavicon, getPageTitle, navigatePage } from "../../utils/casting.js";
+import { getPageFavicon, navigatePage } from "../../utils/casting.js";
+
+function targetInfo(target: Target): { targetId: string; type: string; title: string } {
+  // The pinned Puppeteer version exposes this metadata without a page evaluation.
+  return (target as Target & { _getTargetInfo(): { targetId: string; type: string; title: string } })._getTargetInfo();
+}
+
+// The pinned target/session chain lets a cast attach only its own OOP frames.
+// Unattached discovery entries have no session and must not delay startup.
+type CastChildSession = CDPSession & { _target(): Target; parentSession(): CastChildSession | undefined };
+function isOwnedChildFrame(target: Target, pageId: string | null): boolean {
+  if (!pageId) return false;
+  const child = target as Target & { _session?: () => CastChildSession | undefined };
+  let parent = child._session?.()?.parentSession();
+  for (let depth = 0; parent && depth < 16; depth++, parent = parent.parentSession()) {
+    if (targetInfo(parent._target()).targetId === pageId) return true;
+  }
+  return false;
+}
+
+// WEBCHAT_EDITABLE_SCANNER_START
+// DOM search pierces author shadow roots. Each out-of-process frame has its
+// own session; only bounded geometry crosses into the viewer, never values.
+type EditableRect = { x: number; y: number; width: number; height: number };
+type EditableFrame = ReturnType<Page["mainFrame"]> & { client: CDPSession };
+const editableCommands = { timeout: 800 };
+
+async function scanEditableRects(page: Page): Promise<EditableRect[]> {
+  const sessions = new Map<CDPSession, EditableFrame>();
+  for (const frame of page.frames() as EditableFrame[]) {
+    if (!sessions.has(frame.client)) sessions.set(frame.client, frame);
+  }
+  const result: EditableRect[] = [];
+  for (const [client, frame] of [...sessions].slice(0, 16)) {
+    const remaining = 256 - result.length;
+    if (!remaining) break;
+    const rects = await scanEditableSession(client, frame, remaining).catch(() => []);
+    result.push(...rects);
+  }
+  return result;
+}
+
+async function editableFrameOffset(frame: EditableFrame): Promise<{ x: number; y: number }> {
+  if (!frame.parentFrame()) return { x: 0, y: 0 };
+  const owner = await frame.frameElement();
+  if (!owner) throw new Error("Detached editable frame");
+  try {
+    const box = await owner.boxModel();
+    if (!box) throw new Error("Hidden editable frame");
+    return box.content[0];
+  } finally { await owner.dispose(); }
+}
+
+async function scanEditableSession(client: CDPSession, frame: EditableFrame, limit: number): Promise<EditableRect[]> {
+  const offset = await editableFrameOffset(frame);
+  await client.send("DOM.getDocument", { depth: 0, pierce: true }, editableCommands);
+  const search = await client.send("DOM.performSearch", {
+    query: "input,textarea,[contenteditable]", includeUserAgentShadowDOM: false,
+  }, editableCommands);
+  try {
+    if (!search.resultCount) return [];
+    const { nodeIds } = await client.send("DOM.getSearchResults", {
+      searchId: search.searchId, fromIndex: 0, toIndex: Math.min(search.resultCount, 256),
+    }, editableCommands);
+    const rects: EditableRect[] = [];
+    for (let i = 0; i < nodeIds.length && rects.length < limit; i += 16) {
+      const batch = await Promise.all(nodeIds.slice(i, i + 16).map((nodeId) =>
+        editableNodeRect(client, nodeId, offset).catch(() => null)));
+      rects.push(...batch.filter((rect): rect is EditableRect => rect !== null));
+    }
+    return rects.slice(0, limit);
+  } finally {
+    await client.send("DOM.discardSearchResults", { searchId: search.searchId }, editableCommands).catch(() => {});
+  }
+}
+
+// Executes inside the node's own document, including closed author shadow roots.
+function editableNodeVisible(this: HTMLElement): boolean {
+  const input = this instanceof HTMLInputElement;
+  const textarea = this instanceof HTMLTextAreaElement;
+  if (this.matches(":disabled, [inert]")) return false;
+  if (input && (!/^(text|search|email|url|tel|password|number)$/.test(this.type) || this.readOnly)) return false;
+  if (textarea && this.readOnly) return false;
+  if (!input && !textarea && !this.isContentEditable) return false;
+  const rect = this.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return false;
+  const x = (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2;
+  const y = (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2;
+  if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= innerWidth || rect.top >= innerHeight) return false;
+  let node: Element = this;
+  for (let root = node.getRootNode(); root instanceof ShadowRoot; root = node.getRootNode()) {
+    if (!node.contains(root.elementFromPoint(x, y))) return false;
+    node = root.host;
+  }
+  return node.contains(this.ownerDocument.elementFromPoint(x, y));
+}
+
+async function editableNodeRect(client: CDPSession, nodeId: number, offset: { x: number; y: number }): Promise<EditableRect | null> {
+  const { object } = await client.send("DOM.resolveNode", { nodeId }, editableCommands);
+  if (!object.objectId) return null;
+  try {
+    const visible = await client.send("Runtime.callFunctionOn", {
+      objectId: object.objectId, functionDeclaration: editableNodeVisible.toString(),
+      returnByValue: true,
+    }, editableCommands);
+    if (visible.result.value !== true) return null;
+    const { model } = await client.send("DOM.getBoxModel", { nodeId }, editableCommands);
+    const xs = model.border.filter((_, index) => index % 2 === 0);
+    const ys = model.border.filter((_, index) => index % 2 === 1);
+    return { x: Math.min(...xs) + offset.x, y: Math.min(...ys) + offset.y,
+      width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
+  } finally { await client.send("Runtime.releaseObject", { objectId: object.objectId }, editableCommands).catch(() => {}); }
+}
+// WEBCHAT_EDITABLE_SCANNER_END
+
+type CastViewport = { width: number; height: number; mobile: boolean; deviceScaleFactor: number };
+
+// Shared across cast connections, including initial setup and reconnect.
+const targetViewportTransitions = new Map<string, Promise<void>>();
+function serializeTargetViewport(targetId: string, change: () => Promise<void>): Promise<void> {
+  const previous = targetViewportTransitions.get(targetId) || Promise.resolve();
+  const next = previous.catch(() => {}).then(change);
+  targetViewportTransitions.set(targetId, next);
+  void next.finally(() => {
+    if (targetViewportTransitions.get(targetId) === next) targetViewportTransitions.delete(targetId);
+  }).catch(() => {});
+  return next;
+}
+
+type ManagedViewportEvent = { type: "webchatViewportApplied"; pageId: string; viewport: CastViewport };
+
+
+function castMetrics({ width, height, mobile, deviceScaleFactor }: CastViewport) {
+  return {
+    screenWidth: width,
+    screenHeight: height,
+    width,
+    height,
+    mobile,
+    deviceScaleFactor,
+    screenOrientation: height >= width
+      ? { angle: 0, type: "portraitPrimary" as const }
+      : { angle: 90, type: "landscapePrimary" as const },
+  };
+}
+
+function castOptions({ width, height }: CastViewport) {
+  return { format: "jpeg" as const, quality: 75, maxWidth: width, maxHeight: height };
+}
+
+function jpegDimensions(data: string): { width: number; height: number } | null {
+  const image = Buffer.from(data, "base64");
+  if (image[0] !== 0xff || image[1] !== 0xd8) return null;
+  for (let offset = 2; offset + 9 < image.length;) {
+    if (image[offset] !== 0xff) return null;
+    const marker = image[offset + 1];
+    if (marker === 0xda || marker === 0xd9) return null;
+    const length = image.readUInt16BE(offset + 2);
+    if (length < 2 || offset + length + 2 > image.length) return null;
+    if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+      return { height: image.readUInt16BE(offset + 5), width: image.readUInt16BE(offset + 7) };
+    }
+    offset += length + 2;
+  }
+  return null;
+}
+
+function captureBackgroundPage(pageId: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(`ws://127.0.0.1:9222/devtools/page/${pageId}`, {
+      headers: { Origin: "http://127.0.0.1:8793" },
+    });
+    let finished = false;
+    const finish = (error: Error | null, data?: string) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timeout);
+      socket.close();
+      if (error) reject(error);
+      else resolve(data || "");
+    };
+    const timeout = setTimeout(() => finish(new Error("Browser capture timed out")), 3000);
+    socket.once("open", () => socket.send(JSON.stringify({ id: 1, method: "Page.captureScreenshot",
+      params: { format: "jpeg", quality: 75, captureBeyondViewport: false, fromSurface: true } })));
+    socket.on("message", (raw) => {
+      try {
+        const response = JSON.parse(raw.toString());
+        if (response.id === 1) finish(response.error ? new Error(response.error.message) : null, response.result?.data);
+      } catch (error) { finish(error instanceof Error ? error : new Error("Invalid browser capture")); }
+    });
+    socket.once("error", (error) => finish(error));
+    socket.once("close", () => finish(new Error("Browser capture closed")));
+  });
+}
 
 export async function handleCastSession(
   request: IncomingMessage,
@@ -45,22 +239,51 @@ export async function handleCastSession(
   const tabDiscoveryMode =
     queryParams.get("tabInfo") === "true" || (!requestedPageId && !requestedPageIndex);
 
-  const isMobile = session.deviceConfig?.device === "mobile";
+  const webchatManaged = queryParams.get("webchatManaged") === "2";
+  const requestedWidth = Number(queryParams.get("width"));
+  const requestedHeight = Number(queryParams.get("height"));
+  const requestedScale = Number(queryParams.get("deviceScaleFactor"));
+  const hasViewport = Number.isInteger(requestedWidth) && requestedWidth >= 320 && requestedWidth <= 3840
+    && Number.isInteger(requestedHeight) && requestedHeight >= 240 && requestedHeight <= 2160
+    && Number.isFinite(requestedScale) && requestedScale >= 1 && requestedScale <= 4;
+  const isMobile = hasViewport ? queryParams.get("mobile") === "true" : session.deviceConfig?.device === "mobile";
   const defaultDimensions = isMobile ? { width: 508, height: 1074 } : { width: 1920, height: 1080 };
-  const { height, width } =
-    (session.dimensions as { width: number; height: number }) ?? defaultDimensions;
+  const { height, width } = hasViewport ? { width: requestedWidth, height: requestedHeight }
+    : (session.dimensions as { width: number; height: number }) ?? defaultDimensions;
+  const deviceScaleFactor = hasViewport ? requestedScale : isMobile ? 3 : 1;
 
   wss.handleUpgrade(request, socket, head, async (ws) => {
     let browser: Browser | null = null;
     let targetPage: Page | null = null;
     let targetClient: CDPSession | null = null;
     let targetPageId: string | null = null;
+    let currentViewport: CastViewport = { width, height, mobile: isMobile, deviceScaleFactor };
+    let editableRects: EditableRect[] = [];
+    let editableScanPending = false;
+    let editableScanInterval: NodeJS.Timeout | null = null;
+    let frameWatchdog: NodeJS.Timeout | null = null;
+    let fallbackInFlight = false;
+    let lastFrameAt = Date.now();
+    let lastTitle = "";
+    let lastFavicon = "";
+    const changeViewport = (change: () => Promise<void>): Promise<void> => {
+      if (!targetPageId) return Promise.reject(new Error("Browser target unavailable"));
+      return serializeTargetViewport(targetPageId, change);
+    };
 
-    const activePages = new Map<string, Page>();
+    const activePages = new Map<string, Target>();
 
     let heartbeatInterval: NodeJS.Timeout | null = null;
 
     const handleSessionCleanup = () => {
+      if (frameWatchdog) {
+        clearInterval(frameWatchdog);
+        frameWatchdog = null;
+      }
+      if (editableScanInterval) {
+        clearInterval(editableScanInterval);
+        editableScanInterval = null;
+      }
       if (heartbeatInterval) {
         clearInterval(heartbeatInterval);
         heartbeatInterval = null;
@@ -115,6 +338,9 @@ export async function handleCastSession(
       }
     };
 
+    ws.on("close", handleSessionCleanup);
+    ws.on("error", handleSessionCleanup);
+
     const sendTabList = async () => {
       try {
         if (ws.readyState !== WebSocket.OPEN || !tabDiscoveryMode) return;
@@ -125,8 +351,8 @@ export async function handleCastSession(
           tabList.push({
             id: pageId,
             url: page.url(),
-            title: await getPageTitle(page),
-            favicon: await getPageFavicon(page),
+            title: targetInfo(page).title,
+            favicon: "",
           });
         }
 
@@ -175,6 +401,17 @@ export async function handleCastSession(
     try {
       browser = await puppeteer.connect({
         browserWSEndpoint: `ws://${env.HOST}:${env.PORT}`,
+        defaultViewport: null,
+        protocolTimeout: 8000,
+        // Keep unrelated out-of-process frames out of cast initialization.
+        // Attach descendants of the requested page for editable-field metadata.
+        // Chrome tab targets must remain attached to discover their child page.
+        targetFilter: (target) => {
+          const info = targetInfo(target);
+          return info.type === "browser" || info.type === "tab"
+            || (info.type === "page" && (!requestedPageId || info.targetId === requestedPageId))
+            || (info.type === "iframe" && isOwnedChildFrame(target, requestedPageId));
+        },
       });
 
       if (!browser) {
@@ -183,13 +420,11 @@ export async function handleCastSession(
         return;
       }
 
-      const pages = await browser.pages();
+      if (ws.readyState !== WebSocket.OPEN) { handleSessionCleanup(); return; }
 
       if (tabDiscoveryMode) {
-        for (const page of pages) {
-          //@ts-expect-error
-          const pageId = page.target()._targetId;
-          activePages.set(pageId, page);
+        for (const target of browser.targets().filter((item) => item.type() === "page")) {
+          activePages.set(targetInfo(target).targetId, target);
         }
 
         // Initial tab list
@@ -199,10 +434,7 @@ export async function handleCastSession(
         browser.on("targetcreated", async (target) => {
           if (target.type() === "page") {
             try {
-              const page = await target.asPage();
-              //@ts-expect-error
-              const pageId = target._targetId;
-              activePages.set(pageId, page);
+              activePages.set(targetInfo(target).targetId, target);
               await sendTabList();
             } catch (err) {
               console.error("Error handling new target:", err);
@@ -249,18 +481,9 @@ export async function handleCastSession(
           }
         }, 30000);
 
-        ws.on("close", () => {
-          handleSessionCleanup();
-        });
-
-        ws.on("error", (err) => {
-          console.error("Tab discovery WebSocket error:", err);
-          handleSessionCleanup();
-        });
-
         return;
       } else {
-        const targetResult = await findTargetPage(pages);
+        const targetResult = await findTargetPage(await browser.pages());
 
         if (!targetResult) {
           console.error(
@@ -275,19 +498,26 @@ export async function handleCastSession(
         targetPage = targetResult.page;
         targetPageId = targetResult.pageId;
 
-        await targetPage.bringToFront();
+        if (!webchatManaged) await targetPage.bringToFront();
 
         // Setup screencast for the target page
         targetClient = await targetPage.target().createCDPSession();
+        if (ws.readyState !== WebSocket.OPEN) { handleSessionCleanup(); return; }
+        void getPageFavicon(targetPage).then((favicon) => { lastFavicon = favicon || ""; }).catch(() => {});
 
         ws.on("message", async (message) => {
+          let webchatInputId: string | undefined;
           try {
+            const envelope = JSON.parse(message.toString());
+            if (webchatManaged && typeof envelope.webchatInputId === "string") webchatInputId = envelope.webchatInputId;
             const data:
               | MouseEvent
               | KeyEvent
               | NavigationEvent
               | CloseTabEvent
-              | GetSelectedTextEvent = JSON.parse(message.toString());
+              | GetSelectedTextEvent
+              | ResizeEvent
+              | ManagedViewportEvent = JSON.parse(message.toString());
             const { type } = data;
 
             if (!targetClient || !targetPage) {
@@ -296,6 +526,44 @@ export async function handleCastSession(
             }
 
             switch (type) {
+              case "webchatViewportApplied": {
+                if (!webchatManaged || data.pageId !== targetPageId) break;
+                const viewport = (data as ManagedViewportEvent).viewport;
+                if (!viewport || !Number.isInteger(viewport.width) || !Number.isInteger(viewport.height)
+                    || viewport.width < 320 || viewport.width > 3840 || viewport.height < 240 || viewport.height > 2160) break;
+                await changeViewport(async () => {
+                  const client = targetClient;
+                  if (!client) throw new Error("Browser target disconnected");
+                  await client.send("Page.stopScreencast");
+                  currentViewport = viewport;
+                  await client.send("Page.startScreencast", castOptions(viewport));
+                });
+                break;
+              }
+              case "resize": {
+                if (webchatManaged) break;
+                const { width: nextWidth, height: nextHeight, mobile, deviceScaleFactor, revision } = data as ResizeEvent;
+                if (data.pageId !== targetPageId) break;
+                if (!Number.isInteger(nextWidth) || !Number.isInteger(nextHeight)
+                    || nextWidth < 320 || nextWidth > 3840 || nextHeight < 240 || nextHeight > 2160
+                    || !Number.isFinite(deviceScaleFactor) || deviceScaleFactor < 1 || deviceScaleFactor > 4) break;
+                const nextViewport = { width: nextWidth, height: nextHeight, mobile: Boolean(mobile), deviceScaleFactor };
+                try {
+                  await changeViewport(async () => {
+                    const client = targetClient;
+                    if (!client) throw new Error("Browser target disconnected");
+                    await client.send("Page.stopScreencast");
+                    await client.send("Page.setDeviceMetricsOverride", castMetrics(nextViewport));
+                    await client.send("Page.startScreencast", castOptions(nextViewport));
+                    currentViewport = nextViewport;
+                  });
+                  ws.send(JSON.stringify({ type: "viewportApplied", pageId: targetPageId, revision }));
+                } catch (error) {
+                  ws.send(JSON.stringify({ type: "viewportFailed", pageId: targetPageId, revision }));
+                  console.error("Could not resize browser viewport:", error);
+                }
+                break;
+              }
               case "mouseEvent": {
                 const { event } = data as MouseEvent;
                 await targetClient.send("Input.dispatchMouseEvent", {
@@ -303,7 +571,7 @@ export async function handleCastSession(
                   x: event.x,
                   y: event.y,
                   button: event.button,
-                  buttons: event.button === "none" ? 0 : 1,
+                  buttons: event.buttons ?? (event.type === "mouseReleased" || event.button === "none" ? 0 : 1),
                   clickCount: event.clickCount || 1,
                   modifiers: event.modifiers || 0,
                   deltaX: event.deltaX,
@@ -313,6 +581,12 @@ export async function handleCastSession(
               }
               case "keyEvent": {
                 const { event } = data as KeyEvent;
+                if (event.type === "char") {
+                  // Committed IME/paste text is not a physical key. dispatchKeyEvent
+                  // rejects longer Unicode sequences (including joined emoji).
+                  await targetClient.send("Input.insertText", { text: event.text || "" });
+                  break;
+                }
                 await targetClient.send("Input.dispatchKeyEvent", {
                   type: event.type,
                   text: event.text,
@@ -344,6 +618,11 @@ export async function handleCastSession(
               case "getSelectedText": {
                 try {
                   const selectedText = await targetPage.evaluate(() => {
+                    const focused = document.activeElement;
+                    if (focused instanceof HTMLTextAreaElement
+                        || (focused instanceof HTMLInputElement && focused.type !== "password")) {
+                      return focused.value.slice(focused.selectionStart ?? 0, focused.selectionEnd ?? 0);
+                    }
                     const selection = window.getSelection();
                     return selection ? selection.toString() : "";
                   });
@@ -373,42 +652,36 @@ export async function handleCastSession(
               default:
                 console.warn("Unknown event type:", type);
             }
+            if (webchatInputId) ws.send(JSON.stringify({ type: "webchatInputApplied", requestId: webchatInputId, ok: true }));
           } catch (err) {
+            if (webchatInputId) ws.send(JSON.stringify({ type: "webchatInputApplied", requestId: webchatInputId, ok: false }));
             console.error("Error handling WebSocket message:", err);
           }
         });
 
-        // Setup device metrics and start screencast
-        await targetClient.send("Page.setDeviceMetricsOverride", {
-          screenHeight: height,
-          screenWidth: width,
-          width,
-          height,
-          mobile: isMobile,
-          screenOrientation: isMobile
-            ? { angle: 0, type: "portraitPrimary" }
-            : { angle: 90, type: "landscapePrimary" },
-          deviceScaleFactor: isMobile ? 3 : 1,
-        });
-
-        await targetClient.send("Page.startScreencast", {
-          format: "jpeg",
-          quality: 75,
-          maxWidth: width,
-          maxHeight: height,
-        });
+        // Apply metrics before capture, then install the frame listener before starting it.
+        if (!webchatManaged) {
+          await changeViewport(() => targetClient!.send("Page.setDeviceMetricsOverride", castMetrics(currentViewport)).then(() => {}));
+        }
 
         // Handle screencast frames
-        targetClient.on("Page.screencastFrame", async ({ data, sessionId }) => {
+        targetClient.on("Page.screencastFrame", async ({ data, sessionId, metadata }) => {
           try {
             // Acknowledge the frame right away to free up memory
             await targetClient?.send("Page.screencastFrameAck", { sessionId });
 
+            // A second debugger can briefly expose Chrome's physical compositor
+            // size while the page itself remains at the selected viewport.
+            // Keep the last valid frame instead of displaying that wrong-sized cast.
+            if (Math.abs(metadata.deviceWidth - currentViewport.width) > 2
+                || Math.abs(metadata.deviceHeight - currentViewport.height) > 2) {
+              return;
+            }
             if (ws.readyState === WebSocket.OPEN) {
-              // Get page metadata
-              const title = await getPageTitle(targetPage!);
-              const favicon = await getPageFavicon(targetPage!);
-
+              // Metadata must never hold up frame delivery on a busy page.
+              const title = targetInfo(targetPage!.target()).title;
+              const favicon = lastFavicon;
+              lastTitle = title;
               // Send frame data
               ws.send(
                 JSON.stringify({
@@ -417,13 +690,49 @@ export async function handleCastSession(
                   title,
                   favicon,
                   data,
+                  metadata,
+                  editableRects,
                 }),
               );
+              lastFrameAt = Date.now();
             }
           } catch (err) {
             console.error("Error in Page.screencastFrame handler:", err);
           }
         });
+
+        if (webchatManaged) editableScanInterval = setInterval(() => {
+          if (editableScanPending || !targetPage || ws.readyState !== WebSocket.OPEN) return;
+          editableScanPending = true;
+          // Keep DOM inspection out of the screencast callback. A slow page
+          // must never delay or freeze the visual stream.
+          void scanEditableRects(targetPage).then((rects) => { editableRects = rects; }).catch(() => { editableRects = []; })
+            .finally(() => { editableScanPending = false; });
+        }, 250);
+
+        if (webchatManaged) frameWatchdog = setInterval(() => {
+          if (fallbackInFlight || !targetPage || !targetPageId
+              || ws.readyState !== WebSocket.OPEN || Date.now() - lastFrameAt < 1500) return;
+          fallbackInFlight = true;
+          const viewport = { ...currentViewport };
+          // Chromium pauses Page.screencastFrame for background tabs. A guarded
+          // capture keeps each Webchat viewer current without stealing tab focus.
+          void captureBackgroundPage(targetPageId).then((data) => {
+            const dimensions = jpegDimensions(data);
+            if (ws.readyState !== WebSocket.OPEN || !dimensions
+                || dimensions.width !== viewport.width || dimensions.height !== viewport.height
+                || viewport.width !== currentViewport.width || viewport.height !== currentViewport.height) return;
+            ws.send(JSON.stringify({ pageId: targetPageId, url: targetPage?.url(), title: lastTitle,
+              favicon: lastFavicon, data, editableRects,
+              metadata: { timestamp: Date.now() / 1000,
+                deviceWidth: viewport.width, deviceHeight: viewport.height } }));
+            lastFrameAt = Date.now();
+          }).catch((error) => console.error("Could not capture silent browser cast:", error))
+            .finally(() => { fallbackInFlight = false; });
+        }, 500);
+
+        if (webchatManaged) ws.send(JSON.stringify({ type: "webchatCastReady", pageId: targetPageId }));
+        await changeViewport(() => targetClient!.send("Page.startScreencast", castOptions(currentViewport)).then(() => {}));
 
         // Cleanup when target is destroyed
         browser.on("targetdestroyed", async (target) => {
@@ -466,16 +775,7 @@ export async function handleCastSession(
           }
         }, 30000);
 
-        // Cleanup on WebSocket closure
-        ws.on("close", () => {
-          handleSessionCleanup();
-        });
 
-        // Handle errors
-        ws.on("error", (err) => {
-          console.error("Cast WebSocket error:", err);
-          handleSessionCleanup();
-        });
       }
     } catch (err) {
       console.error("Error in cast session:", err);
