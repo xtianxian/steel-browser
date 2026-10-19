@@ -998,8 +998,6 @@ export class CDPService extends EventEmitter {
 
         const headfulArgs = [
           "--ozone-platform=x11",
-          "--disable-renderer-backgrounding",
-          "--disable-backgrounding-occluded-windows",
           "--use-gl=swiftshader",
           "--in-process-gpu",
           "--enable-crashpad",
@@ -1047,7 +1045,11 @@ export class CDPService extends EventEmitter {
           defaultViewport: null,
           args: launchArgs,
           executablePath: this.chromeExecPath,
-          ignoreDefaultArgs: ["--enable-automation", "--disable-extensions"],
+          // Keep normal Chrome background scheduling. Explicit options.args /
+          // CHROME_ARGS can still opt a workload out without affecting other defaults.
+          ignoreDefaultArgs: ["--enable-automation", "--disable-extensions",
+            "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows", ...env.FILTER_CHROME_ARGS],
           timeout: Math.min(
             options.timeout && options.timeout > 0 ? options.timeout : 30_000,
             scope.remaining(),
