@@ -24,6 +24,7 @@ import puppeteer, {
 } from "puppeteer-core";
 import { Duplex } from "stream";
 import { env } from "../../env.js";
+import { browserDefaultArgsToIgnore } from "../../utils/browser-arguments.js";
 import { loadFingerprintScript } from "../../scripts/index.js";
 import { traceable, tracer } from "../../telemetry/tracer.js";
 import { BrowserEventType, BrowserLauncherOptions, EmitEvent } from "../../types/index.js";
@@ -1047,9 +1048,7 @@ export class CDPService extends EventEmitter {
           executablePath: this.chromeExecPath,
           // Keep normal Chrome background scheduling. Explicit options.args /
           // CHROME_ARGS can still opt a workload out without affecting other defaults.
-          ignoreDefaultArgs: ["--enable-automation", "--disable-extensions",
-            "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows", ...env.FILTER_CHROME_ARGS],
+          ignoreDefaultArgs: browserDefaultArgsToIgnore(launchArgs, env.FILTER_CHROME_ARGS),
           timeout: Math.min(
             options.timeout && options.timeout > 0 ? options.timeout : 30_000,
             scope.remaining(),
