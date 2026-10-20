@@ -49,7 +49,8 @@
     "test:heavy": "SCRAPE_EVAL_HEAVY=1 vitest run",
     "eval:report": "tsx src/utils/scrape/__tests__/eval/runEval.ts",
     "pretty": "prettier --write \"src/**/*.ts\"",
-    "generate:openapi": "tsx ./openapi/generate.ts"
+    "generate:openapi": "tsx ./openapi/generate.ts",
+    "test:webchat-viewer:benchmark": "node scripts/webchat-viewer-benchmark.mjs"
   },
   "author": "Nasr Mohamed",
   "devDependencies": {

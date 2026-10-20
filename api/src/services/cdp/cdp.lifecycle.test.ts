@@ -78,6 +78,9 @@ describe("CDP launch deadline and owned cleanup", () => {
     expect(vi.mocked(puppeteer.launch).mock.calls[0][0]?.ignoreDefaultArgs).toEqual([
       "--enable-automation",
       "--disable-extensions",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-backgrounding-occluded-windows",
     ]);
     controller.abort();
     await expect(launch).rejects.toMatchObject({ name: "AbortError" });

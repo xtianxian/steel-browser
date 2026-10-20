@@ -15,6 +15,7 @@ import {
   ResizeEvent,
 } from "../../types/casting.js";
 import { getPageFavicon, navigatePage } from "../../utils/casting.js";
+import { createSharedScan } from "../../utils/shared-scan.js";
 
 function targetInfo(target: Target): { targetId: string; type: string; title: string } {
   // The pinned Puppeteer version exposes this metadata without a page evaluation.
@@ -128,6 +129,8 @@ async function editableNodeRect(client: CDPSession, nodeId: number, offset: { x:
   } finally { await client.send("Runtime.releaseObject", { objectId: object.objectId }, editableCommands).catch(() => {}); }
 }
 // WEBCHAT_EDITABLE_SCANNER_END
+
+const sharedEditableRects = createSharedScan<EditableRect[]>(250);
 
 type CastViewport = { width: number; height: number; mobile: boolean; deviceScaleFactor: number };
 
@@ -706,7 +709,7 @@ export async function handleCastSession(
           editableScanPending = true;
           // Keep DOM inspection out of the screencast callback. A slow page
           // must never delay or freeze the visual stream.
-          void scanEditableRects(targetPage).then((rects) => { editableRects = rects; }).catch(() => { editableRects = []; })
+          void sharedEditableRects(targetPageId!, () => scanEditableRects(targetPage!)).then((rects) => { editableRects = rects; }).catch(() => { editableRects = []; })
             .finally(() => { editableScanPending = false; });
         }, 250);
 
