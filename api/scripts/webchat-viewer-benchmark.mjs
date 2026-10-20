@@ -338,7 +338,29 @@ try {
   await closeViews(viewers);
   viewers = await Promise.all(Array.from({ length: 4 }, () => view(pages[0])));
   await measure("four-viewers-one-chat", viewers);
+  await pages[0].evaluate(() => { window.animate = true; });
+  const continuing = viewers[3];
+  await closeViews(viewers.slice(0, 3));
+  let frameStart = continuing.frames;
+  await measure("one-of-four-viewers-remains-visible", [continuing]);
+  assert(continuing.frames - frameStart > seconds * 5, "Closing other viewers interrupted the visible viewer");
+  // Reconnection belongs to the returning client; it must not stall an existing client.
+  for (let i = 0; i < 12; i++) {
+    const returning = await view(pages[0]);
+    frameStart = continuing.frames;
+    await closeViews([returning]);
+    await sleep(300);
+    assert(continuing.frames > frameStart, "Returning viewer cleanup interrupted the remaining viewer");
+  }
+  results.independentViewerReconnects = 12;
+  await pages[0].evaluate(() => { window.animate = false; });
+  viewers = [continuing];
   await closeViews(viewers);
+  await measure("last-shared-viewer-disconnected", []);
+  // A native automation write/read still works with no viewer. This is CDP, not extension acceptance.
+  await pages[0].evaluate(() => { document.querySelector('#answer').value = 'AUTOMATION-WITHOUT-VIEWER'; });
+  assert.equal(await pages[0].$eval('#answer', (e) => e.value), 'AUTOMATION-WITHOUT-VIEWER');
+  results.automationWithoutViewer = true;
   viewers = await Promise.all(pages.map(view));
   await measure("16-chat-viewers", viewers);
   assert(
